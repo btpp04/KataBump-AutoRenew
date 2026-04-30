@@ -1,0 +1,120 @@
+name: 🔄 KataBump Auto Renew
+
+on:
+  # 手动触发
+  workflow_dispatch:
+  # 定时触发 - 每天 UTC 02:30 (北京时间 10:30)
+  schedule:
+    - cron: "30 2 * * *"
+
+# 权限配置：允许提交和推送更改（用于 time.txt 防休眠）
+permissions:
+  contents: write
+
+concurrency:
+  group: kata-renew
+  cancel-in-progress: false
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # 步骤 1: 检出仓库
+      - name: 📥 检出仓库
+        uses: actions/checkout@v4
+
+      # 步骤 2: 设置 Node.js
+      - name: 🟢 设置 Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # 步骤 3: 安装系统依赖
+      - name: 📦 安装系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+
+      # 步骤 4: 安装 Node.js 依赖
+      - name: 📚 安装 Node.js 依赖
+        run: npm install
+
+      # 步骤 5: 安装 Playwright 浏览器
+      - name: 🌐 安装 Playwright 浏览器
+        run: npx playwright install-deps chromium
+
+      # 步骤 6: 安装 Hysteria2（如果需要代理）
+      - name: 📡 安装 Hysteria2
+        run: |
+          if [ -n "${{ secrets.HY2_PROXY_URL }}" ]; then
+            echo "安装 Hysteria2..."
+            curl -L -o hysteria \
+              https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-amd64
+            chmod +x hysteria
+            sudo mv hysteria /usr/local/bin/hysteria
+            hysteria version
+            echo "✅ Hysteria2 安装完成"
+          else
+            echo "⚠️ 未配置代理，跳过 Hysteria2 安装"
+          fi
+
+      # 步骤 7: 启动 Hysteria2 代理（如果需要）
+      - name: 🔌 启动 Hysteria2 代理
+        run: |
+          if [ -n "${{ secrets.HY2_PROXY_URL }}" ]; then
+            echo "启动 Hysteria2 SOCKS5 代理 (端口 ${{ secrets.SOCKS_PORT || '51080' }})..."
+            nohup hysteria client \
+              --server "${{ secrets.HY2_PROXY_URL }}" \
+              --socks5 "127.0.0.1:${{ secrets.SOCKS_PORT || '51080' }}" \
+              > /tmp/hy2.log 2>&1 &
+            sleep 3
+            echo "✅ Hysteria2 代理已启动"
+          else
+            echo "⚠️ 直连模式"
+          fi
+
+      # 步骤 8: 添加随机延迟
+      - name: ⏳ 添加随机延迟
+        run: |
+          delay=$((RANDOM % 120))
+          echo "随机延迟: ${delay}秒"
+          sleep $delay
+
+      # 步骤 9: 执行续期脚本
+      - name: 🚀 执行 KataBump 续期
+        env:
+          USERS_JSON: ${{ secrets.USERS_JSON }}
+          HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" node action_renew.js
+
+      # 步骤 10: 上传截图
+      - name: 📸 上传截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: katabump-screenshots
+          path: screenshots/
+          retention-days: 7
+          if-no-files-found: warn
+
+      # 步骤 11: 提交时间文件（防仓库休眠）
+      - name: ⏱️ 提交时间文件
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "$(date +'%Y-%m-%d %H:%M:%S')" > time.txt
+          git add time.txt 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "无变化，无需提交"
+          else
+            TIMESTAMP=$(date +'%Y-%m-%d %H:%M:%S')
+            git commit -m "⏱️ 更新时间: $TIMESTAMP"
+            git pull --rebase origin main
+            git push origin HEAD:main
+            echo "✅ 时间文件已推送"
+          fi
